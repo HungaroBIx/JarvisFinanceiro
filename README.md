@@ -4,6 +4,16 @@ Bot no Telegram para controle de gastos pessoais. Envie uma foto de nota fiscal 
 
 ---
 
+## Produção
+
+| Serviço | Plataforma | URL / Acesso |
+|---|---|---|
+| Bot Telegram | Railway | Rodando 24h em background |
+| Dashboard | Streamlit Community Cloud | [jarvisfinanceiro.streamlit.app](https://jarvisfinanceiro.streamlit.app) |
+| Banco de dados | Supabase | PostgreSQL na nuvem |
+
+---
+
 ## Stack
 
 | Camada | Tecnologia |
