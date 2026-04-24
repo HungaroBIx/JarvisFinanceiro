@@ -1,0 +1,367 @@
+================================================================================
+FEATURE: Importação de Fatura de Cartão de Crédito via PDF
+================================================================================
+
+CONTEXTO
+--------
+O bot hoje registra gastos manualmente (texto ou foto de cupom fiscal).
+Esta feature permite ao usuário enviar o PDF da fatura do cartão de crédito
+diretamente no Telegram. O bot extrai todos os lançamentos via Claude API,
+exibe um preview para confirmação e salva tudo no Supabase de uma vez.
+
+ARQUIVOS A MODIFICAR
+--------------------
+1. requirements.txt          — adicionar pdfplumber
+2. bot/claude.py             — nova função + prompt para extração de fatura
+3. bot/bot.py                — novo estado, dois handlers, atualizar ConversationHandler
+
+ARQUIVOS DE REFERÊNCIA (não modificar, só consultar)
+-----------------------------------------------------
+- bot/db.py                  — usar db.salvar_gasto() existente (sem alterações)
+- supabase_schema.sql        — schema da tabela gastos (sem alterações)
+
+
+================================================================================
+PASSO 1 — requirements.txt
+================================================================================
+
+Adicionar após a linha "Pillow>=10.0.0":
+
+    pdfplumber>=0.10.0
+
+Verificar instalação: pip install -r requirements.txt
+
+
+================================================================================
+PASSO 2 — bot/claude.py
+================================================================================
+
+--- 2a. Nova constante PROMPT_FATURA ---
+Adicionar após o bloco PROMPT_IMAGEM existente:
+
+    PROMPT_FATURA = f"""Você é um extrator de lançamentos de faturas de cartão de crédito brasileiras.
+
+    Analise o texto abaixo extraído de uma fatura e identifique TODOS os lançamentos de compras/gastos.
+
+    Para cada lançamento extraia:
+    - valor: número decimal em reais (ex: 45.90). Use ponto como separador decimal.
+    - estabelecimento: nome do estabelecimento, limpo e legível, máximo 40 caracteres.
+    - categoria: classifique em uma das categorias disponíveis.
+    - data: data do lançamento no formato YYYY-MM-DD.
+
+    Categorias disponíveis: {', '.join(CATEGORIAS)}
+
+    Regras importantes:
+    - Ignore pagamentos, créditos, estornos de fatura, IOF separado e anuidade.
+    - Ignore linhas de totais, subtotais e saldo anterior.
+    - Se um lançamento tiver parcela (ex: "2/6"), inclua-o com o valor da parcela.
+
+    Responda SOMENTE com um array JSON válido, sem texto adicional:
+    [
+      {{"valor": 45.90, "estabelecimento": "McDonald's", "categoria": "Alimentação", "data": "2026-03-15"}},
+      {{"valor": 120.00, "estabelecimento": "Uber", "categoria": "Transporte", "data": "2026-03-16"}}
+    ]
+
+    Se não encontrar nenhum lançamento, retorne um array vazio: []
+
+    Texto da fatura:
+    {{fatura_texto}}"""
+
+NOTA: o placeholder {{fatura_texto}} deve ser substituído via .replace() na função,
+não via f-string, pois a string já é um f-string com CATEGORIAS.
+
+
+--- 2b. Nova função extrair_gastos_fatura() ---
+Adicionar após extrair_gasto_imagem():
+
+    def extrair_gastos_fatura(texto_pdf: str) -> Optional[list[dict]]:
+        if not texto_pdf or not texto_pdf.strip():
+            return None
+        texto_truncado = texto_pdf[:15_000]  # protege contra PDFs gigantes
+        client = anthropic.Anthropic()
+        try:
+            resposta = client.messages.create(
+                model=MODELO,
+                max_tokens=4096,  # fatura com 100 itens pode gerar ~3000 tokens
+                messages=[
+                    {
+                        "role": "user",
+                        "content": PROMPT_FATURA.replace("{fatura_texto}", texto_truncado),
+                    }
+                ],
+            )
+        except Exception:
+            return None
+        return _parse_resposta_fatura(resposta.content[0].text)
+
+
+--- 2c. Novo helper _parse_resposta_fatura() ---
+Adicionar após _parse_resposta() existente:
+
+    def _parse_resposta_fatura(texto: str) -> Optional[list[dict]]:
+        try:
+            texto = texto.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            resultado = json.loads(texto)
+            if not isinstance(resultado, list):
+                return None
+            return [
+                g for g in resultado
+                if isinstance(g, dict) and isinstance(g.get("valor"), (int, float))
+            ]
+        except (json.JSONDecodeError, AttributeError):
+            return None
+
+
+================================================================================
+PASSO 3 — bot/bot.py
+================================================================================
+
+--- 3a. Adicionar estado CONFIRMANDO_FATURA ---
+Linha atual (approx. linha 27):
+    AGUARDANDO, CONFIRMANDO = range(2)
+
+Substituir por:
+    AGUARDANDO, CONFIRMANDO, CONFIRMANDO_FATURA = range(3)
+
+
+--- 3b. Adicionar import pdfplumber ---
+Junto com os outros imports no topo do arquivo:
+    import pdfplumber
+
+
+--- 3c. Helper síncrono _extrair_texto_pdf() ---
+Adicionar antes de receber_foto() ou após os imports, fora de qualquer handler:
+
+    def _extrair_texto_pdf(pdf_bytes: bytes) -> Optional[str]:
+        try:
+            buf = io.BytesIO(pdf_bytes)
+            with pdfplumber.open(buf) as pdf:
+                paginas = [p.extract_text() for p in pdf.pages if p.extract_text()]
+            return "\n\n".join(paginas) if paginas else None
+        except Exception:
+            logger.exception("Erro ao extrair texto do PDF")
+            return None
+
+NOTA: função síncrona pura — será chamada via asyncio.to_thread() no handler.
+
+
+--- 3d. Handler receber_fatura() ---
+Adicionar após receber_foto():
+
+    async def receber_fatura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        doc = update.message.document
+
+        if doc.file_size and doc.file_size > 10 * 1024 * 1024:
+            await update.message.reply_text(
+                "❌ Arquivo muito grande (máximo 10 MB).\n"
+                "Tente exportar a fatura direto do app do banco."
+            )
+            return AGUARDANDO
+
+        await update.message.reply_text("⏳ Lendo fatura PDF...")
+
+        arquivo = await doc.get_file()
+        buf = io.BytesIO()
+        await arquivo.download_to_memory(buf)
+
+        texto_pdf = await asyncio.to_thread(_extrair_texto_pdf, buf.getvalue())
+
+        if texto_pdf is None:
+            await update.message.reply_text(
+                "❌ Não consegui ler o texto do PDF.\n\n"
+                "Verifique se a fatura tem texto selecionável "
+                "(não é uma imagem escaneada)."
+            )
+            return AGUARDANDO
+
+        await update.message.reply_text("🔍 Identificando lançamentos com IA...")
+
+        gastos = await asyncio.to_thread(claude.extrair_gastos_fatura, texto_pdf)
+
+        if gastos is None:
+            await update.message.reply_text(
+                "❌ Erro ao processar a fatura. Tente novamente."
+            )
+            return AGUARDANDO
+
+        if len(gastos) == 0:
+            await update.message.reply_text(
+                "🤔 Nenhum lançamento encontrado.\n\n"
+                "Certifique-se de que é uma fatura de cartão de crédito com compras."
+            )
+            return AGUARDANDO
+
+        context.user_data["gastos_pendentes"] = gastos
+        return await _exibir_confirmacao_fatura(update, context)
+
+
+--- 3e. Helper _exibir_confirmacao_fatura() ---
+Adicionar após _exibir_confirmacao() existente:
+
+    async def _exibir_confirmacao_fatura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        gastos = context.user_data["gastos_pendentes"]
+        total = sum(float(g["valor"]) for g in gastos)
+        total_fmt = f"R$ {total:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        linhas = [
+            f"📄 *Fatura — {len(gastos)} lançamentos*",
+            f"💸 *Total:* {total_fmt}\n",
+            "*Primeiros lançamentos:*",
+        ]
+
+        for g in gastos[:10]:
+            val = f"R$ {float(g['valor']):.2f}".replace(".", ",")
+            data = ""
+            try:
+                data = f" ({datetime.strptime(g['data'], '%Y-%m-%d').strftime('%d/%m')})"
+            except Exception:
+                pass
+            estab = (g.get("estabelecimento") or "?")[:35]
+            linhas.append(f"  • {estab}{data} — {val}")
+
+        if len(gastos) > 10:
+            linhas.append(f"  _...e mais {len(gastos) - 10} lançamentos_")
+
+        linhas.append("\nDeseja salvar *todos* os lançamentos?")
+
+        mensagem = "\n".join(linhas)
+        if len(mensagem) > 4000:
+            mensagem = mensagem[:4000] + "\n_[truncado]_"
+
+        await update.message.reply_text(
+            mensagem,
+            parse_mode="Markdown",
+            reply_markup=TECLADO_CONFIRMACAO,
+        )
+        return CONFIRMANDO_FATURA
+
+
+--- 3f. Handler confirmar_fatura() ---
+Adicionar após confirmar():
+
+    async def confirmar_fatura(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        resposta = update.message.text
+
+        if "✅" in resposta or "sim" in resposta.lower():
+            gastos = context.user_data.pop("gastos_pendentes", [])
+            await update.message.reply_text(f"⏳ Salvando {len(gastos)} lançamentos...")
+
+            hoje = datetime.now().strftime("%Y-%m-%d")
+            erros = 0
+            for g in gastos:
+                try:
+                    await asyncio.to_thread(
+                        db.salvar_gasto,
+                        valor=float(g["valor"]),
+                        data=g.get("data") or hoje,
+                        estabelecimento=g.get("estabelecimento") or "Não identificado",
+                        categoria=g.get("categoria") or "Outros",
+                    )
+                except Exception:
+                    logger.exception("Erro ao salvar lançamento da fatura: %s", g)
+                    erros += 1
+
+            salvos = len(gastos) - erros
+            msg = (
+                f"💾 {salvos} lançamentos salvos com sucesso!"
+                if erros == 0
+                else f"⚠️ {salvos} salvos, {erros} falharam (verifique os logs)."
+            )
+            await update.message.reply_text(msg, reply_markup=ReplyKeyboardRemove())
+            return AGUARDANDO
+
+        if "❌" in resposta or "não" in resposta.lower() or "nao" in resposta.lower():
+            context.user_data.pop("gastos_pendentes", None)
+            await update.message.reply_text(
+                "❌ Importação cancelada.",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return AGUARDANDO
+
+        await update.message.reply_text(
+            "Use os botões para confirmar ou cancelar a importação:",
+            reply_markup=TECLADO_CONFIRMACAO,
+        )
+        return CONFIRMANDO_FATURA
+
+
+--- 3g. Atualizar ConversationHandler em main() ---
+
+Em entry_points, adicionar junto com os outros MessageHandlers:
+    MessageHandler(filters.Document.PDF, receber_fatura),
+
+Em states > AGUARDANDO, adicionar a mesma linha:
+    MessageHandler(filters.Document.PDF, receber_fatura),
+
+Em states, adicionar novo estado CONFIRMANDO_FATURA:
+    CONFIRMANDO_FATURA: [
+        MessageHandler(filters.TEXT & ~filters.COMMAND, confirmar_fatura),
+    ],
+
+NOTA: filters.Document.PDF é o filtro correto do python-telegram-bot >= 21
+para capturar arquivos PDF pelo MIME type application/pdf.
+
+
+================================================================================
+EDGE CASES COBERTOS
+================================================================================
+
+| Caso                              | Onde tratado               | Comportamento                              |
+|-----------------------------------|----------------------------|--------------------------------------------|
+| PDF > 10 MB                       | receber_fatura()           | Rejeita antes de baixar                    |
+| PDF escaneado (sem texto digital) | _extrair_texto_pdf()       | Retorna None → mensagem de erro específica |
+| Erro no pdfplumber                | _extrair_texto_pdf()       | Captura exceção, loga, retorna None        |
+| Claude retorna array vazio []     | receber_fatura()           | Mensagem: nenhum lançamento encontrado     |
+| Erro de API ou JSON inválido      | extrair_gastos_fatura()    | Retorna None → mensagem genérica de erro   |
+| Um insert falha no meio da lista  | confirmar_fatura() loop    | Salva o resto, reporta contagem de erros   |
+| Preview > 4096 chars (Telegram)   | _exibir_confirmacao_fatura | Trunca em 4000 chars, adiciona nota        |
+
+
+================================================================================
+FLUXO COMPLETO (para referência)
+================================================================================
+
+Usuário envia PDF no Telegram
+  → receber_fatura() detectado por filters.Document.PDF
+  → Verifica tamanho (máx 10 MB)
+  → Baixa arquivo para memória (io.BytesIO)
+  → _extrair_texto_pdf() via asyncio.to_thread() extrai texto com pdfplumber
+  → claude.extrair_gastos_fatura() via asyncio.to_thread() chama Claude API
+      └─ Claude recebe texto da fatura + PROMPT_FATURA
+      └─ Retorna JSON array: [{valor, estabelecimento, categoria, data}, ...]
+  → Guarda lista em context.user_data["gastos_pendentes"]
+  → _exibir_confirmacao_fatura() mostra preview + total + primeiros 10 itens
+  → Estado muda para CONFIRMANDO_FATURA
+  → Usuário responde ✅ Sim ou ❌ Não
+  → confirmar_fatura():
+      ✅ Sim → loop salvando cada gasto via db.salvar_gasto() → AGUARDANDO
+      ❌ Não → descarta lista → AGUARDANDO
+
+
+================================================================================
+VERIFICAÇÃO (teste end-to-end após implementação)
+================================================================================
+
+1. pip install -r requirements.txt  — confirmar que pdfplumber instala sem conflitos
+2. Enviar PDF de fatura real no Telegram
+3. Verificar mensagem de preview com contagem, total e lista de lançamentos
+4. Confirmar com ✅ Sim
+5. Consultar Supabase:
+       SELECT * FROM gastos ORDER BY criado_em DESC LIMIT 100
+   Verificar que os lançamentos aparecem com categorias corretas
+6. Testar cancelamento com ❌ Não — confirmar que nada foi salvo
+7. Testar com PDF escaneado — verificar mensagem de erro adequada
+8. Testar arquivo não-PDF enviado como documento — não deve acionar o handler
+
+
+================================================================================
+DEPENDÊNCIAS E COMPATIBILIDADE
+================================================================================
+
+- pdfplumber>=0.10.0 depende de pdfminer.six (instalado automaticamente)
+- Compatível com Python 3.9+ (usa str.removeprefix disponível desde 3.9)
+- Não requer alterações no schema do Supabase (usa tabela gastos existente)
+- Não requer alterações no dashboard/app.py
+- CATEGORIAS não precisa ser alterada
+
+================================================================================
